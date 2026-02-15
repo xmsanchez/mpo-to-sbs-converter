@@ -2,9 +2,9 @@ import os
 import sys
 import argparse
 import subprocess
-import shutil
+import json
 import time
-from PIL import Image, UnidentifiedImageError
+from PIL import Image
 from datetime import datetime
 
 # ---------------------------------------------------------------------
@@ -12,7 +12,7 @@ from datetime import datetime
 # ---------------------------------------------------------------------
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Convert Fujifilm W3 Photos (MPO) and Videos (AVI) to XREAL format (Recursive).")
+    parser = argparse.ArgumentParser(description="Convert Fujifilm W3 files to XREAL format (Recursive).")
     
     # Path Arguments
     parser.add_argument('-i', '--input', default='./input', help="Input folder containing files (searches recursively).")
@@ -23,7 +23,42 @@ def parse_arguments():
     parser.add_argument('--skip-photos', action='store_true', help="Do not process .MPO photos.")
     parser.add_argument('--skip-videos', action='store_true', help="Do not process .AVI videos.")
     
+    # Metadata Arguments
+    parser.add_argument('--xreal', action='store_true', help="Generate hidden .xrealmeta sidecar files during conversion.")
+    parser.add_argument('--xreal-metadata-only', action='store_true', help="Scan OUTPUT folder and generate missing .xrealmeta files only (skips conversion).")
+    
     return parser.parse_args()
+
+def create_xreal_metadata(file_path):
+    """
+    Creates a hidden .[filename_no_ext].xrealmeta file in the same folder.
+    Content: {"Is3D":true}
+    """
+    folder = os.path.dirname(file_path)
+    filename = os.path.basename(file_path)
+    
+    # Strip extension (e.g. remove .jpg or .mp4)
+    filename_no_ext = os.path.splitext(filename)[0]
+    
+    # Sidecar filename convention: .filename_no_ext.xrealmeta
+    # Note the leading dot!
+    meta_name = f".{filename_no_ext}.xrealmeta"
+    meta_path = os.path.join(folder, meta_name)
+    
+    data = {"Is3D": True}
+    
+    try:
+        with open(meta_path, 'w') as f:
+            json.dump(data, f)
+        # Hide the file on Windows (optional, good practice)
+        if os.name == 'nt':
+            try:
+                subprocess.run(['attrib', '+h', meta_path], check=False)
+            except: pass
+        return True
+    except Exception as e:
+        print(f"    [ERR] Could not write metadata: {e}")
+        return False
 
 def get_timestamp_from_file(filepath):
     try:
@@ -49,23 +84,36 @@ def match_file_dates(source_path, target_path):
         pass
 
 # ---------------------------------------------------------------------
-# VIDEO PROCESSING (FFMPEG)
+# METADATA ONLY MODE
 # ---------------------------------------------------------------------
 
-def convert_video(file_path, output_folder, ffmpeg_cmd):
+def generate_metadata_only(output_base):
+    print(f"Scanning '{output_base}' recursively for SV_ files to tag...")
+    count = 0
+    for root, dirs, files in os.walk(output_base):
+        for file in files:
+            lower = file.lower()
+            if lower.endswith('.jpg') or lower.endswith('.mp4'):
+                # Check if it looks like one of our converted files (SV_)
+                if "SV_" in file:
+                    full_path = os.path.join(root, file)
+                    if create_xreal_metadata(full_path):
+                        count += 1
+    print(f"Generated {count} metadata sidecar files.")
+
+# ---------------------------------------------------------------------
+# VIDEO PROCESSING
+# ---------------------------------------------------------------------
+
+def convert_video(file_path, output_folder, ffmpeg_cmd, generate_meta):
     filename = os.path.basename(file_path)
+    if not os.path.exists(output_folder): os.makedirs(output_folder)
     
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-    
-    # Generate Filename
     date_obj = get_timestamp_from_file(file_path)
-    timestamp_str = date_obj.strftime('%Y%m%d_%H%M%S')
-    clean_name = f"SV_{timestamp_str}.mp4" 
+    clean_name = f"SV_{date_obj.strftime('%Y%m%d_%H%M%S')}.mp4" 
     clean_name = get_unique_filename(output_folder, clean_name)
     output_path = os.path.join(output_folder, clean_name)
     
-    # FFmpeg Command
     cmd = [
         ffmpeg_cmd, '-y', '-i', file_path,       
         '-filter_complex', '[0:v:0][0:v:1]hstack=inputs=2[v]', 
@@ -76,12 +124,14 @@ def convert_video(file_path, output_folder, ffmpeg_cmd):
     ]
 
     print(f"--> Video: {filename}")
-    
     try:
         result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         if result.returncode == 0:
             match_file_dates(file_path, output_path)
             print(f"    [OK] Saved as {clean_name}")
+            if generate_meta:
+                create_xreal_metadata(output_path)
+                print("    [+] Metadata created")
         else:
             print(f"    [ERR] FFmpeg failed: {result.stderr}")
     except FileNotFoundError:
@@ -89,14 +139,12 @@ def convert_video(file_path, output_folder, ffmpeg_cmd):
         sys.exit(1)
 
 # ---------------------------------------------------------------------
-# PHOTO PROCESSING (PILLOW)
+# PHOTO PROCESSING
 # ---------------------------------------------------------------------
 
-def convert_photo(file_path, output_folder):
+def convert_photo(file_path, output_folder, generate_meta):
     filename = os.path.basename(file_path)
-
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
+    if not os.path.exists(output_folder): os.makedirs(output_folder)
     
     try:
         with Image.open(file_path) as im:
@@ -112,16 +160,13 @@ def convert_photo(file_path, output_folder):
             sbs.paste(left_img, (0, 0))
             sbs.paste(right_img, (w, 0))
 
-            # Metadata & Naming
             exif = im._getexif()
             date_obj = None
             if exif and 36867 in exif:
-                try:
-                    date_obj = datetime.strptime(exif[36867], '%Y:%m:%d %H:%M:%S')
+                try: date_obj = datetime.strptime(exif[36867], '%Y:%m:%d %H:%M:%S')
                 except: pass
             
-            if not date_obj:
-                date_obj = get_timestamp_from_file(file_path)
+            if not date_obj: date_obj = get_timestamp_from_file(file_path)
 
             clean_name = f"SV_{date_obj.strftime('%Y%m%d_%H%M%S')}.jpg"
             clean_name = get_unique_filename(output_folder, clean_name)
@@ -134,6 +179,10 @@ def convert_photo(file_path, output_folder):
             
             match_file_dates(file_path, output_path)
             print(f"    [OK] Photo: {filename} -> {clean_name}")
+            
+            if generate_meta:
+                create_xreal_metadata(output_path)
+                print("    [+] Metadata created")
 
     except Exception as e:
         print(f"    [ERR] {filename}: {e}")
@@ -145,49 +194,53 @@ def convert_photo(file_path, output_folder):
 def main():
     args = parse_arguments()
 
+    # MODE: Generate Metadata ONLY (no conversion)
+    if args.xreal_metadata_only:
+        if not os.path.exists(args.output):
+            print(f"Error: Output folder '{args.output}' does not exist.")
+            sys.exit(1)
+        generate_metadata_only(args.output)
+        sys.exit(0)
+
+    # MODE: Standard Conversion
     if not os.path.exists(args.input):
         print(f"Error: Input folder '{args.input}' not found.")
         sys.exit(1)
 
-    # Define Output Subfolders
     img_output_dir = os.path.join(args.output, 'images')
     vid_output_dir = os.path.join(args.output, 'videos')
 
-    # RECURSIVE SEARCH
     videos = []
     photos = []
     
     print(f"Scanning '{args.input}' recursively...")
-
     for root, dirs, files in os.walk(args.input):
         for file in files:
-            # We store the FULL path to the file
             full_path = os.path.join(root, file)
-            
             if not args.skip_videos and file.lower().endswith('.avi'):
                 videos.append(full_path)
             elif not args.skip_photos and file.lower().endswith('.mpo'):
                 photos.append(full_path)
 
     if not videos and not photos:
-        print(f"No compatible files found in '{args.input}' or its subfolders.")
+        print(f"No compatible files found.")
         sys.exit(0)
 
     print(f"Found: {len(photos)} Photos | {len(videos)} Videos")
+    if args.xreal:
+        print(">> XREAL Metadata generation ENABLED")
     print("-" * 50)
 
-    # Process Photos
     if photos:
         print("Starting Photo Conversion...")
         for f in photos:
-            convert_photo(f, img_output_dir)
+            convert_photo(f, img_output_dir, args.xreal)
         print("-" * 50)
 
-    # Process Videos
     if videos:
         print("Starting Video Conversion...")
         for f in videos:
-            convert_video(f, vid_output_dir, args.ffmpeg)
+            convert_video(f, vid_output_dir, args.ffmpeg, args.xreal)
         print("-" * 50)
 
     print("All tasks completed.")
